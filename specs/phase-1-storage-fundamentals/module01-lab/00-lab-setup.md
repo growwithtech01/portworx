@@ -1,7 +1,7 @@
 # Module 01 Lab — Environment Setup
 
 ```
-Environment : Docker Ubuntu container on macOS
+Environment : Ubuntu container on macOS (Podman or Docker Desktop)
 Module      : 01 — Storage From First Principles
 All labs run inside the container — not on your Mac
 ```
@@ -14,9 +14,9 @@ All labs run inside the container — not on your Mac
 
 ---
 
-### Docker on Mac Is Not Docker on Linux
+### Containers on Mac Always Run Inside a VM
 
-On a Linux server, containers share the host's kernel directly:
+On a Linux server, containers share the host kernel directly:
 
 ```
 ┌─────────────────────────────────────┐
@@ -35,31 +35,33 @@ On a Linux server, containers share the host's kernel directly:
 
 This is why `--privileged` on a Linux server is risky — the container touches the real host kernel.
 
-**Your Mac is different.** macOS runs the Darwin (XNU) kernel — not Linux. Docker Desktop cannot share your Mac kernel with a Linux container because they are different kernels entirely.
+**Your Mac is different.** macOS runs the Darwin (XNU) kernel — not Linux. Neither Podman nor Docker Desktop can share your Mac kernel with a Linux container because they are completely different kernels.
 
-So Docker Desktop installs a **hidden Linux VM** first, then runs containers inside that VM:
+Both Podman and Docker Desktop solve this the same way — they install a **hidden Linux VM** first, then run containers inside that VM:
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  Your MacBook (macOS / Darwin XNU kernel)            │
-│  ← never touched by any container command            │
-│                                                      │
-│  ┌──────────────────────────────────────────────┐    │
-│  │  Docker Desktop VM (Apple Hypervisor)        │    │
-│  │  Lightweight Linux distro (LinuxKit)         │    │
-│  │                                              │    │
-│  │  ┌──────────────┐  ┌──────────────┐         │    │
-│  │  │ Ubuntu       │  │ Any other    │         │    │
-│  │  │ Container    │  │ Container    │         │    │
-│  │  └──────┬───────┘  └──────┬───────┘         │    │
-│  │         │                 │                 │    │
-│  │  ───────┴─────────────────┴──────────────   │    │
-│  │      Linux Kernel (belongs to the VM)       │    │
-│  └──────────────────────────────────────────┘  │    │
-│                                                      │
-│  Apple Silicon / Intel hardware                      │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Your MacBook (macOS / Darwin XNU kernel)                │
+│  ← never touched by any container command                │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │  Podman Machine VM  (or Docker Desktop VM)       │    │
+│  │  Lightweight Linux — Apple Virtualization        │    │
+│  │                                                  │    │
+│  │  ┌──────────────┐  ┌──────────────┐             │    │
+│  │  │ Ubuntu       │  │ Any other    │             │    │
+│  │  │ Container    │  │ Container    │             │    │
+│  │  └──────┬───────┘  └──────┬───────┘             │    │
+│  │         │                 │                     │    │
+│  │  ───────┴─────────────────┴──────────────────   │    │
+│  │      Linux Kernel (belongs to the VM only)      │    │
+│  └──────────────────────────────────────────────┘  │    │
+│                                                          │
+│  Apple Silicon / Intel hardware                          │
+└──────────────────────────────────────────────────────────┘
 ```
+
+**Podman Machine = same VM safety as Docker Desktop.** The blast radius of every lab command stops at the VM boundary.
 
 ---
 
@@ -67,46 +69,44 @@ So Docker Desktop installs a **hidden Linux VM** first, then runs containers ins
 
 | Command / Operation | Affects Mac? | Why |
 |--------------------|-------------|-----|
-| `--privileged` flag | No | Gives root access to the VM's Linux kernel, not macOS |
+| `--privileged` flag | No | Root access to the VM's Linux kernel, not macOS |
 | Loop devices (`/dev/loop*`) | No | Created inside the VM kernel, invisible to macOS |
-| `mdadm` RAID arrays | No | Software RAID runs inside the VM |
-| `mkfs`, `fdisk`, `parted` | No | Operating on loop device image files inside the VM |
+| `mdadm` RAID arrays | No | Software RAID lives inside the VM |
+| `mkfs`, `fdisk`, `parted` | No | Operate on loop device image files inside the VM |
 | `/proc/sys/vm/drop_caches` | No | The VM's `/proc`, not macOS |
 | `fio`, `dd` writes | No | Write to files inside the VM filesystem |
-| Killing processes, crashing VM | No | Docker Desktop restarts the VM automatically |
+| Crashing the VM | No | Podman/Docker restarts the VM automatically |
 
-**Worst case**: you crash the VM. Docker Desktop shows a restart prompt. Your Mac is unaffected.
+**Worst case**: you crash the VM. Podman shows a restart prompt. Your Mac is unaffected.
 
 ---
 
 ### The ONE Thing That Touches Your Mac
 
-The volume mount in the `docker run` command:
+The volume mount flag:
 
 ```bash
--v /tmp/px-lab:/tmp/px-lab
+-v ~/px-lab:/tmp/px-lab
 ```
 
 This is the **only bridge** between macOS and the container:
 
 ```
-macOS filesystem               VM filesystem        Container
-────────────────               ─────────────        ──────────
-/tmp/px-lab/       ←────────────────────────────→  /tmp/px-lab/
-(on your Mac SSD)    shared via Apple Hypervisor    (inside container)
+macOS filesystem            VM filesystem        Container
+────────────────            ─────────────        ──────────
+~/px-lab/       ←──────────────────────────────→ /tmp/px-lab/
+(on your Mac SSD)  shared via Apple Hypervisor   (inside container)
 ```
 
-Files you create in `/tmp/px-lab` inside the container are stored as regular files on your Mac's SSD. They consume disk space but cannot harm macOS.
+Disk image files you create inside `/tmp/px-lab/` are stored as plain files in `~/px-lab/` on your Mac. They consume disk space but cannot harm macOS.
 
-**Total disk space used across all labs**: 1–3 GB maximum.
+**Total disk space across all labs**: 1–3 GB maximum.
 
-**To clean up everything after finishing**:
+**To clean up after finishing all labs**:
 ```bash
-# Run this on your Mac terminal (NOT inside the container)
-rm -rf /tmp/px-lab
+# On your Mac terminal (NOT inside the container)
+rm -rf ~/px-lab
 ```
-
-`/tmp` on macOS is also automatically cleared on every reboot.
 
 ---
 
@@ -114,10 +114,10 @@ rm -rf /tmp/px-lab
 
 ```
 Your MacBook (macOS — untouched by lab commands)
-└── Docker Desktop VM (Linux VM, managed by Apple Hypervisor)
+└── Podman Machine VM (Linux VM, Apple Virtualization Framework)
     └── Ubuntu 22.04 Container   ← you work here
         ├── /dev/loop*           ← virtual disks you create (inside VM)
-        ├── /tmp/px-lab/disks/   ← image files (shared back to Mac via volume)
+        ├── /tmp/px-lab/disks/   ← image files (shared back to Mac at ~/px-lab/)
         ├── fio                  ← I/O benchmarking tool
         ├── sysstat (iostat)     ← real-time I/O monitoring
         ├── mdadm                ← software RAID management
@@ -128,28 +128,107 @@ You will create virtual disks using loop devices. These behave identically to re
 
 ---
 
-## Step 1 — Start the Ubuntu Container
+## Choose Your Runtime
 
-Open your terminal on macOS and run:
+### Option A — Podman (Recommended — Free, No License)
+
+**Install Podman**:
 
 ```bash
+# Install via Homebrew
+brew install podman
+
+# Verify installation
+podman --version
+```
+
+**Initialize and start the Podman VM** (one-time setup):
+
+```bash
+# Create the VM with enough resources for the labs
+podman machine init \
+  --cpus 2 \
+  --memory 2048 \
+  --disk-size 20 \
+  --volume ~/px-lab:/tmp/px-lab
+
+# Start the VM
+podman machine start
+
+# Verify the VM is running
+podman machine list
+```
+
+Expected output:
+```
+NAME                     VM TYPE     CREATED     LAST UP     CPUS  MEMORY  DISK SIZE
+podman-machine-default*  applehv     1 min ago   1 min ago   2     2GiB    20GiB
+```
+
+The `*` means it is the active machine.
+
+---
+
+### Option B — Docker Desktop (If Already Installed)
+
+If Docker Desktop is available and allowed, it works identically. Skip the Podman setup and use `docker` wherever this guide says `podman`.
+
+| Podman command | Docker equivalent |
+|---------------|------------------|
+| `podman run` | `docker run` |
+| `podman exec` | `docker exec` |
+| `podman ps` | `docker ps` |
+| `podman start` | `docker start` |
+| `podman machine start` | (Docker Desktop auto-starts) |
+
+---
+
+## Step 1 — Create the Lab Directory and Start the Container
+
+**On your Mac terminal**, create the shared directory first:
+
+```bash
+mkdir -p ~/px-lab/disks
+mkdir -p ~/px-lab/mounts
+echo "Lab directory ready:"
+ls -la ~/px-lab/
+```
+
+**Start the Ubuntu container**:
+
+```bash
+# Using Podman:
+podman run -it \
+  --name px-storage-lab \
+  --privileged \
+  --cap-add=SYS_ADMIN \
+  --cap-add=MKNOD \
+  -v ~/px-lab:/tmp/px-lab \
+  ubuntu:22.04 \
+  bash
+
+# Using Docker Desktop (identical flags):
 docker run -it \
   --name px-storage-lab \
   --privileged \
   --cap-add=SYS_ADMIN \
   --cap-add=MKNOD \
-  -v /tmp/px-lab:/tmp/px-lab \
+  -v ~/px-lab:/tmp/px-lab \
   ubuntu:22.04 \
   bash
 ```
 
 **Why `--privileged`?**
-Loop devices, RAID (mdadm), and filesystem operations require elevated kernel privileges. `--privileged` gives the container root-level access to the Docker VM's Linux kernel — not to macOS. Safe on Mac because of the VM layer.
+Loop devices, RAID (mdadm), and filesystem operations require elevated kernel privileges. `--privileged` gives the container root-level access to the **VM's** Linux kernel — not macOS. Safe on Mac because of the VM layer.
 
-**Why `-v /tmp/px-lab:/tmp/px-lab`?**
-This mounts a directory from your Mac into the container. Disk image files you create in `/tmp/px-lab/` persist even if the container restarts. This is the only directory shared between macOS and the container.
+**Why `-v ~/px-lab:/tmp/px-lab`?**
+Persists disk image files on your Mac so they survive container restarts. This is the only path shared between macOS and the container.
+
+**Why `~/px-lab` instead of `/tmp/px-lab`?**
+Podman Machine automatically shares your home directory (`~`). `/tmp` on macOS is a symlink to `/private/tmp` and may not be shared depending on Podman version. Using `~/px-lab` is reliable across all versions.
 
 You should now see a prompt like:
+
 ```
 root@abc123def456:/#
 ```
@@ -158,7 +237,7 @@ root@abc123def456:/#
 
 ## Step 2 — Install Required Tools
 
-Run this entire block inside the container:
+Run this entire block **inside the container**:
 
 ```bash
 apt-get update -qq && apt-get install -y \
@@ -193,20 +272,9 @@ apt-get update -qq && apt-get install -y \
 
 ---
 
-## Step 3 — Prepare the Disk Image Directory
+## Step 3 — Verify Your Environment
 
-```bash
-mkdir -p /tmp/px-lab/disks
-mkdir -p /tmp/px-lab/mounts
-echo "Lab directory ready at /tmp/px-lab"
-ls -la /tmp/px-lab/
-```
-
----
-
-## Step 4 — Verify Your Environment
-
-Run this verification script:
+Run this verification script **inside the container**:
 
 ```bash
 cat << 'VERIFY' > /tmp/verify-env.sh
@@ -232,6 +300,15 @@ echo "[ LOOP DEVICES ]"
 losetup -l 2>/dev/null || echo "  No loop devices active"
 echo ""
 
+echo "[ SHARED VOLUME MOUNT ]"
+if ls /tmp/px-lab/ &>/dev/null; then
+  echo "  ✓ /tmp/px-lab/ is mounted (shared with Mac ~/px-lab/)"
+  ls /tmp/px-lab/
+else
+  echo "  ✗ /tmp/px-lab/ NOT mounted — check -v flag in run command"
+fi
+
+echo ""
 echo "[ DISK SPACE IN CONTAINER ]"
 df -h /
 echo ""
@@ -256,7 +333,8 @@ chmod +x /tmp/verify-env.sh
 bash /tmp/verify-env.sh
 ```
 
-**Expected output** (yours will vary slightly):
+**Expected output**:
+
 ```
 === Environment Verification ===
 
@@ -268,16 +346,20 @@ bash /tmp/verify-env.sh
   ...
 
 [ BLOCK DEVICES ]
-NAME  MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
-vda   252:0    0  59G  0 disk
-└─vda1 252:1   0  59G  0 part /
+NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+vda    252:0    0   20G  0 disk
+└─vda1 252:1    0   20G  0 part /
 
 [ LOOP DEVICES ]
   No loop devices active
 
+[ SHARED VOLUME MOUNT ]
+  ✓ /tmp/px-lab/ is mounted (shared with Mac ~/px-lab/)
+  disks  mounts
+
 [ DISK SPACE IN CONTAINER ]
 Filesystem      Size  Used Avail Use% Mounted on
-overlay         59G   4.5G   52G  8% /
+overlay          20G  1.5G   18G   8% /
 
 [ PRIVILEGED CHECK ]
   ✓ Container has device access (privileged)
@@ -285,28 +367,39 @@ overlay         59G   4.5G   52G  8% /
 
 ---
 
-## Step 5 — Returning to the Lab After Closing
+## Step 4 — Returning to the Lab After Closing
 
-If you close your terminal, your container keeps running. To return:
+If you close your terminal, the container keeps running. To return:
 
 ```bash
-# List running containers
-docker ps
-
-# Re-attach to the container
-docker exec -it px-storage-lab bash
+# Using Podman:
+podman ps                                             # list running containers
+podman exec -it px-storage-lab bash                   # re-attach
 
 # If container was stopped:
+podman start px-storage-lab && podman exec -it px-storage-lab bash
+
+# Using Docker Desktop:
+docker ps
+docker exec -it px-storage-lab bash
 docker start px-storage-lab && docker exec -it px-storage-lab bash
 ```
 
-**Important**: Loop devices do NOT persist across container restarts. Disk image files in `/tmp/px-lab/disks/` persist (because of the volume mount), but you must recreate `losetup` bindings after each restart.
+**If Podman Machine was stopped** (e.g., after Mac reboot):
+
+```bash
+podman machine start           # restart the VM first
+podman start px-storage-lab    # then restart the container
+podman exec -it px-storage-lab bash
+```
+
+**Important**: Loop devices do NOT persist across container restarts. Disk image files in `~/px-lab/disks/` persist (because of the volume mount), but you must recreate `losetup` bindings after each restart.
 
 ---
 
-## Helper Functions
+## Step 5 — Helper Functions
 
-Add these to your shell for convenience during labs:
+Add these to your shell **inside the container** for convenience during labs:
 
 ```bash
 cat << 'HELPERS' >> ~/.bashrc
@@ -331,13 +424,13 @@ rmdisk() {
   echo "Removed: $dev and $img"
 }
 
-# Show all active loop devices
+# Show all active loop devices and disk images
 disks() {
   echo "=== Loop Devices ==="
   losetup -l
   echo ""
-  echo "=== Disk Images ==="
-  ls -lh /tmp/px-lab/disks/ 2>/dev/null
+  echo "=== Disk Images on Mac (~/px-lab/disks/) ==="
+  ls -lh /tmp/px-lab/disks/ 2>/dev/null || echo "  (empty)"
 }
 
 HELPERS
@@ -348,8 +441,56 @@ echo "Helper functions loaded: mkdisk, rmdisk, disks"
 
 ---
 
+## Troubleshooting Podman
+
+**Problem: `podman machine start` fails**
+
+```bash
+# Stop and recreate the machine
+podman machine stop
+podman machine rm
+podman machine init --cpus 2 --memory 2048 --disk-size 20 --volume ~/px-lab:/tmp/px-lab
+podman machine start
+```
+
+**Problem: `/tmp/px-lab` not found inside container**
+
+```bash
+# On Mac: verify the directory exists
+ls ~/px-lab
+
+# Check if Podman machine was initialized with the volume
+podman machine inspect | grep -A 5 Mounts
+
+# If volume not set, recreate machine with --volume flag (see above)
+```
+
+**Problem: `--privileged` operations fail (loop devices, mdadm)**
+
+```bash
+# Verify the container is truly privileged
+podman inspect px-storage-lab | grep Privileged
+# Should show: "Privileged": true
+
+# If false: remove and recreate container with --privileged flag
+podman rm -f px-storage-lab
+# Then re-run the podman run command from Step 1
+```
+
+**Problem: `podman` command not found after install**
+
+```bash
+# Reload your shell PATH
+source ~/.zshrc   # or ~/.bashrc depending on your shell
+
+# Or use full path
+/opt/homebrew/bin/podman --version
+```
+
+---
+
 ## You Are Ready
 
 Move to [01-questions.md](./01-questions.md) — 20 use-case questions.
 
-Come back to this file if any tool is missing or if you need to rebuild the environment.
+Come back to this file if any tool is missing or if Podman needs troubleshooting.

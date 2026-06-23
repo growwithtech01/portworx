@@ -2,7 +2,7 @@
 
 ```
 Prereq  : Complete 00-lab-setup.md first
-Env     : Ubuntu 22.04 Docker container (privileged)
+Env     : Ubuntu 22.04 container via Podman or Docker Desktop (privileged)
 Progress: Questions 1–5 → Observe | 6–10 → Measure | 11–15 → Build | 16–20 → Break & Fix
 ```
 
@@ -26,9 +26,9 @@ Here is exactly what each section does and does not touch on your Mac:
 ```
 Your MacBook (macOS)
       ↓  only bridge
--v /tmp/px-lab:/tmp/px-lab   ← shared folder (files here = on your Mac SSD)
+-v ~/px-lab:/tmp/px-lab   ← shared folder (files here = on your Mac SSD at ~/px-lab/)
       ↓  blast radius stops here
-Docker Desktop VM (Linux)
+Podman Machine VM (or Docker Desktop VM)
       ↓  everything below is inside the VM
 Ubuntu Container
   ├── /dev/loop*        loop devices      → inside VM kernel only
@@ -82,10 +82,8 @@ To clean up after all labs are done:
 
 ```bash
 # On your Mac terminal (not inside the container)
-rm -rf /tmp/px-lab
+rm -rf ~/px-lab
 ```
-
-`/tmp` on macOS is also auto-cleared on every reboot — so even if you forget to clean up, it disappears on next restart.
 
 ### What "Break and Fix" Means in Section D
 
@@ -263,7 +261,7 @@ Section D simulates disk failures and RAID degradation. These sound scary but:
 **Scenario**: A production incident is in progress. Someone says "the disk is saturated." You need to verify this claim in real time using standard Linux tools — not vendor dashboards.
 
 **Task**:
-1. Open **two terminal sessions** into the container (use `docker exec -it px-storage-lab bash` for the second)
+1. Open **two terminal sessions** into the container (use `podman exec -it px-storage-lab bash` or `docker exec -it px-storage-lab bash` for the second)
 2. Terminal 1: run `iostat -x 1` and let it run
 3. Terminal 2: run a fio workload in the background
 4. In Terminal 1, observe the iostat output change in real time
