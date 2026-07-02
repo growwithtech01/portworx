@@ -631,139 +631,249 @@ The real saturation signal:
 
 ## Section C — Build
 
+> All commands in this section run inside your Ubuntu container. The container runs inside the Docker/Podman VM on your Mac. Loop devices and filesystems are created in the VM kernel — your macOS is never touched.
+
 ---
 
 ### Solution Q11 — Create a Virtual Block Device
 
-**Commands**:
+**Commands** (run inside container):
 
 ```bash
-# Step 1: Create the disk image file
+# Step 1: Create the disk image file (500MB of zeros)
 dd if=/dev/zero of=/tmp/px-lab/disks/disk01.img bs=1M count=500 status=progress
-# Creates a 500MB file filled with zeros
 
-# Step 2: Attach to a loop device
+# Step 2: Attach to the next available loop device, capture device path
 DISK01=$(losetup -f --show /tmp/px-lab/disks/disk01.img)
 echo "Disk attached as: $DISK01"
+# Typical output: /dev/loop0
 
-# Step 3: Verify it appears as block device
+# Step 3: Verify it appears as a block device
 lsblk $DISK01
-# Shows: loop0 ... 500M 0 loop
+# NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+# loop0    7:0    0  500M  0 loop
 
-# Step 4: Check size is correct
-lsblk -o NAME,SIZE,TYPE $DISK01
-
-# Step 5: Confirm it's a block device
+# Step 4: Check the device type
 ls -la $DISK01
-# Output: brw-rw---- 1 root disk 7, 0 ... /dev/loop0
-# The 'b' at the start means block device
+# brw-rw---- 1 root disk 7, 0 ... /dev/loop0
+# ↑ 'b' = block device (c = character, d = directory, - = regular file)
 ```
 
-**Why loop devices work**:
+**Where things actually live in your setup**:
 
 ```
-The Linux kernel's loop driver provides a mechanism to treat a
-regular file as a block device.
-
-How it works:
-  1. You have: /tmp/px-lab/disks/disk01.img (regular file, 500MB of zeros)
-  2. losetup binds /dev/loop0 to this file
-  3. The loop driver intercepts all I/O to /dev/loop0
-  4. Translates block reads/writes → file reads/writes on disk01.img
-  5. Rest of the kernel thinks /dev/loop0 is a real block device
-
-The kernel mechanism: the loop module (loop.ko) in the kernel
-Check: lsmod | grep loop
+MacBook (macOS / Darwin kernel)
+└── ~/px-lab/disks/disk01.img   ← the image file on your Mac SSD
+    ↕ (shared via Apple Hypervisor volume mount)
+Docker/Podman VM (Linux kernel)
+└── /tmp/px-lab/disks/disk01.img  ← same file, VM's view of it
+    ↓ (losetup binds it)
+    /dev/loop0                    ← virtual block device (lives in VM kernel)
+Ubuntu container
+└── sees /dev/loop0 via --privileged + shared VM kernel
+    sees /tmp/px-lab/disks/ via -v volume mount
 ```
 
-**Why Portworx uses entire raw block devices without partitioning**:
+**How loop devices work**:
 
 ```
-Partitions add a layer of indirection:
-  /dev/sdb → partition table → /dev/sdb1
-  Each partition access requires reading the partition table first
-  Small overhead, but overhead nonetheless
+Regular file on disk:
+  /tmp/px-lab/disks/disk01.img — 500MB of raw bytes, no structure
 
-Portworx skips partitions:
-  Uses /dev/sdb directly
-  Portworx manages its own internal layout (pools, journals, data)
-  Eliminates one kernel indirection layer
-  Result: slightly lower latency, simpler code path
+After losetup:
+  /dev/loop0 is a kernel device node
+  The loop driver intercepts ALL I/O addressed to /dev/loop0
+  Translates: read/write at byte offset N → read/write at offset N in disk01.img
+  Result: rest of the kernel (parted, mkfs, mount) sees a real block device
+
+This is byte-for-byte identical to talking to a physical SSD.
+The loop driver adds < 1μs overhead — negligible for learning.
+```
+
+**Why `lsmod | grep loop` returns nothing** (even though loop devices work):
+
+```
+Kernel features can exist in two forms:
+
+  Built-in (CONFIG_BLK_DEV_LOOP=y):
+    Compiled directly into the kernel binary
+    Always available — no loading required
+    NEVER appears in lsmod (lsmod only lists runtime-loadable modules)
+    This is what Docker/Podman VM kernels use
+
+  Loadable module (CONFIG_BLK_DEV_LOOP=m):
+    Shipped as loop.ko file
+    Loaded on first use via modprobe
+    Shows up in lsmod after loading
+
+The Docker Desktop and Podman Machine VMs compile loop as built-in.
+lsmod returning nothing does NOT mean loop is absent.
+```
+
+**How to verify loop support without lsmod**:
+
+```bash
+# Fastest: ask for next free device — if it answers, loop works
+losetup -f
+# /dev/loop0
+
+# Check kernel config (if available)
+zcat /proc/config.gz 2>/dev/null | grep CONFIG_BLK_DEV_LOOP
+# CONFIG_BLK_DEV_LOOP=y  ← 'y' = built-in, not a module
+
+# Also works: list active loop attachments
+losetup -l
+```
+
+**Real-world connection**:
+
+```
+AWS EBS volumes are virtual block devices — the same concept.
+When an EC2 instance gets a 500GB EBS volume attached, it appears as /dev/xvdf.
+Behind the scenes, AWS maps that device to a file or volume on their distributed storage.
+Your loop device is the same abstraction at a smaller scale.
+
+Portworx dev environments use loop devices because:
+  - CI/CD pipelines have no spare disks
+  - Loop devices are created/destroyed in seconds
+  - Behave identically to real NVMe drives for API and filesystem purposes
+  - Portworx's integration tests run entirely on loop devices in containers
 ```
 
 ---
 
 ### Solution Q12 — Partition the Virtual Disk
 
-**Commands**:
+**The Container Problem First**
+
+On a real Linux server, after creating partitions with `parted`, you run `partprobe` or `kpartx` to tell the kernel about new partitions. In a container on Docker/Podman VM, these tools fail silently or require udev support that containers do not have:
+
+```
+Real Linux server:
+  parted creates partition → partprobe → udev sees event → /dev/sda1 appears
+  Works because container has full access to udev daemon
+
+Your setup (container inside VM):
+  parted creates partition → partprobe → udev not running in container → nothing happens
+  kpartx -a → device mapper may be unavailable → nothing happens
+```
+
+**The correct container approach: detach and re-attach with `--partscan`**
 
 ```bash
 # Step 1: Create GPT partition table
 parted $DISK01 mklabel gpt
+# Output: Information: You may need to update /etc/fstab.
+# ← This is NOT an error. Parted always prints this after partition operations. Ignore it.
 
-# Step 2: Create first partition (250MB, first half)
+# Step 2: Create first partition (50% = 250MB, for ext4)
 parted $DISK01 mkpart primary ext4 0% 50%
+# Output: Information: You may need to update /etc/fstab.
 
-# Step 3: Create second partition (250MB, second half)
+# Step 3: Create second partition (remaining 50% = 250MB, for XFS)
 parted $DISK01 mkpart primary xfs 50% 100%
+# Output: Information: You may need to update /etc/fstab.
 
-# Step 4: Tell kernel about new partitions
-partprobe $DISK01
-# OR for loop devices:
-losetup --partscan $DISK01
-# This creates: /dev/loop0p1 and /dev/loop0p2
-
-# Alternative way to force kernel to see partitions:
-kpartx -a $DISK01
-
-# Step 5: Verify partitions
-lsblk $DISK01
-# NAME       SIZE TYPE
-# loop0      500M loop
-# ├─loop0p1  250M part
-# └─loop0p2  250M part
-
+# Step 4: Verify parted sees both partitions (parted stores this in the image file)
 parted $DISK01 print
 # Number  Start   End    Size    File system  Name     Flags
 #  1      1049kB  263MB  262MB   ext4         primary
 #  2      263MB   525MB  262MB   xfs          primary
+
+# Step 5 (CRITICAL — container-specific): Detach and re-attach with --partscan
+# This forces the kernel to read the partition table at attach time,
+# creating partition device nodes without needing udev/partprobe.
+losetup -d $DISK01
+DISK01=$(losetup --partscan -f --show /tmp/px-lab/disks/disk01.img)
+echo "Re-attached as: $DISK01"
+# /dev/loop0  (same device, now with partition scanning enabled)
+
+# Step 6: Verify partition nodes exist
+lsblk $DISK01
+# NAME       MAJ:MIN RM  SIZE RO TYPE MOUNTPOINTS
+# loop0        7:0    0  500M  0 loop
+# ├─loop0p1    7:1    0  250M  0 part
+# └─loop0p2    7:2    0  250M  0 part
+```
+
+**Why `--partscan` works when `partprobe` does not**:
+
+```
+losetup --partscan:
+  Instructs the loop driver to read the partition table during device attachment
+  The loop driver is in the VM kernel, which has full privileges
+  Creates /dev/loop0p1, /dev/loop0p2 directly in the kernel
+  Does not require udev to be running
+  Works correctly inside containers
+
+partprobe:
+  Sends BLKRRPART ioctl to the block device
+  Requires udev to receive the event and create device nodes
+  In a container, udev is not running — device nodes never appear
+  Appears to succeed (exit code 0) but nothing happens
+
+kpartx:
+  Creates device-mapper nodes (/dev/mapper/loop0p1)
+  Requires device mapper kernel module (dm-mod) to be available
+  May work in some privileged containers but unreliable in this setup
 ```
 
 **GPT vs MBR**:
 
 ```
-MBR (Master Boot Record) — legacy:
-  Created in 1983 for IBM PC
+MBR (Master Boot Record):
+  1983 IBM PC standard
+  Stored in first 512 bytes of disk
   Max 4 primary partitions
-  Max disk size: 2TB (32-bit addressing, 512-byte sectors, 2^32 × 512B = 2TB)
-  Still common on old systems
+  Max disk size: 2TB (32-bit LBA addressing × 512-byte sectors)
+  Common on older systems
 
-GPT (GUID Partition Table) — modern:
-  Created as part of UEFI standard
-  Max 128 partitions by default (can be extended)
-  Max disk size: 9.4 ZB (64-bit addressing, virtually unlimited)
-  Each partition has a GUID (globally unique identifier)
-  Two copies of partition table (header + footer) for redundancy
-  All modern systems use GPT
+GPT (GUID Partition Table):
+  UEFI standard, replaces MBR
+  Stores partition table in first 34 sectors AND last 34 sectors (backup copy)
+  Max 128 partitions by default
+  Max disk size: 9.4 ZB (64-bit LBA addressing)
+  Every partition has a UUID (no conflicts across disks)
+  All modern storage uses GPT
 
-Why GPT matters:
-  Portworx nodes often use large disks (> 2TB)
-  GPT supports large disks, MBR does not
-  Check: all Portworx storage disks should use GPT
+Portworx context:
+  Portworx nodes use enterprise NVMe/SAS disks that are often > 2TB
+  Portworx requires GPT on any disk > 2TB
+  But Portworx uses the entire raw disk without any partition table at all (useAll: true)
+  Why? Portworx manages its own internal layout across the raw device
+  Skipping the partition table removes one layer of indirection and eliminates misalignment risk
 ```
 
-**Practical partition limit**: Although GPT supports 128, practical limit is 15 for compatibility with some tools. Portworx recommends using the full disk without partitions anyway.
+**Real-world connection**:
+
+```
+AWS EBS: When you attach a 1TB EBS volume to EC2, you get /dev/xvdf with no partition table.
+You run mkfs.ext4 /dev/xvdf or mount it directly.
+Most cloud-native applications do the same — no partitions, just a raw device.
+
+Portworx does this at scale:
+  StorageCluster with useAll: true scans nodes for unpartitioned, unformatted disks
+  Takes ownership of /dev/sdb, /dev/sdc directly
+  Writes its own metadata in the first blocks (Portworx journal format)
+  No partition table in Portworx-managed disks is intentional, not an oversight.
+
+In this lab you created partitions to learn how they work.
+In production Portworx, you deliberately avoid them.
+```
 
 ---
 
 ### Solution Q13 — Format with ext4 and Explore Inodes
 
-**Commands**:
+> **Prerequisite**: `$DISK01` must be the re-attached loop device from Q12 (the one with `--partscan`). If you opened a new shell, re-run: `DISK01=$(losetup -l | grep disk01.img | awk '{print $1}')` to recover the variable.
+
+**Commands** (run inside container):
 
 ```bash
-# Step 1: Format first partition with ext4
+# Step 1: Format the first partition with ext4
 mkfs.ext4 ${DISK01}p1
-# Or if kpartx: /dev/mapper/loop0p1
+# ${DISK01}p1 = /dev/loop0p1 — exists because of --partscan in Q12
+# You will see: mke2fs creating filesystem with 63488 4k blocks and 65536 inodes
 
 # Step 2: Mount it
 mkdir -p /tmp/px-lab/mounts/ext4test
@@ -773,126 +883,205 @@ mount ${DISK01}p1 /tmp/px-lab/mounts/ext4test
 df -i /tmp/px-lab/mounts/ext4test
 # Filesystem     Inodes IUsed  IFree IUse% Mounted on
 # /dev/loop0p1    65536    11  65525    1% /tmp/px-lab/mounts/ext4test
+# ↑ 65,536 inodes for a 250MB filesystem
 
-# How many inodes? 65,536 (for 250MB partition)
-# Formula: ext4 default = 1 inode per 16KB of space
-# 250MB / 16KB = ~15,625 inodes... but ext4 rounds up
-# Actually: 65536 = 2^16, ext4 uses powers of 2
+# Why 65,536?
+# ext4 default: 1 inode per 16KB of space
+# 250MB = 256,000 KB → 256,000 / 16 = 16,000... but ext4 rounds up to powers of 2
+# 65536 = 2^16 (next power of 2 above 16,000)
 
-# Step 4: Check inode size
+# Step 4: Get detailed inode info from ext4 superblock
 tune2fs -l ${DISK01}p1 | grep -i inode
-# Inode count: 65536
-# Free inodes: 65525
-# Inodes per group: 8192
-# Inode size: 256 (bytes per inode)
+# Inode count:              65536
+# Free inodes:              65525
+# Inodes per group:         8192
+# Inode size:               256     ← 256 bytes per inode
 
-# Step 5: Create 100 files and watch inode usage
+# Total space consumed by inodes: 65536 × 256 bytes = 16MB
+# This space is reserved at format time and cannot be used for file data
+
+# Step 5: Create 100 files, watch inode usage
 for i in $(seq 1 100); do
   touch /tmp/px-lab/mounts/ext4test/file_$i
 done
 df -i /tmp/px-lab/mounts/ext4test
-# IUsed should be 111 (11 system + 100 yours)
+# IUsed: 111  (11 system + 100 your files)
 
-# Step 6: Create filesystem with tiny inode count and exhaust it
+# Step 6: Create a filesystem with artificially low inode count
 dd if=/dev/zero of=/tmp/px-lab/disks/smallinodes.img bs=1M count=100 status=none
 SMALL=$(losetup -f --show /tmp/px-lab/disks/smallinodes.img)
-mkfs.ext4 -N 500 $SMALL   # only 500 inodes!
+mkfs.ext4 -N 500 $SMALL
+# -N 500 forces exactly 500 inodes regardless of filesystem size
 mkdir -p /tmp/px-lab/mounts/inodetest
 mount $SMALL /tmp/px-lab/mounts/inodetest
 
-# Exhaust inodes
+# Exhaust the 500 inodes
 for i in $(seq 1 600); do
-  touch /tmp/px-lab/mounts/inodetest/file_$i 2>&1 | head -1
+  result=$(touch /tmp/px-lab/mounts/inodetest/file_$i 2>&1)
+  if [ -n "$result" ]; then
+    echo "FAILED at file $i: $result"
+    break
+  fi
 done
-# You will see: touch: cannot touch '/tmp/px-lab/mounts/inodetest/file_501': No space left on device
+# Expected: FAILED at file ~491: touch: cannot touch '...': No space left on device
+# (some inodes used by system — actual failure is around 491, not 500)
 
-df -h /tmp/px-lab/mounts/inodetest   # shows space available
-df -i /tmp/px-lab/mounts/inodetest   # shows inodes at 100%
+# The deceptive output:
+df -h /tmp/px-lab/mounts/inodetest
+# /dev/loop5   95M   3.0M   92M   4%  /tmp/px-lab/mounts/inodetest
+# ← MISLEADING: 92MB free, looks healthy
+
+df -i /tmp/px-lab/mounts/inodetest
+# /dev/loop5   500   500   0  100%  /tmp/px-lab/mounts/inodetest
+# ← TRUTH: 0 inodes free, exhausted
 ```
 
-**What is an inode**:
+**What is an inode** (the kernel data structure):
 
 ```
-Inode = Index Node (a data structure on disk)
+Inode = Index Node (one per file/directory on the filesystem)
 
-Every file and directory has exactly one inode.
-The inode stores:
-  - File size
-  - Permissions (rwxr-xr-x)
-  - Owner/group (UID/GID)
-  - Timestamps (created, modified, accessed)
-  - Number of hard links
-  - Pointers to data blocks (where the actual content lives)
+Stored on disk, in the inode table.
+Every file and directory has exactly ONE inode.
 
-What the inode does NOT store:
-  - The filename
-  - The file content
+What an inode stores:
+  File size (in bytes)
+  File type (regular, directory, symlink, block device...)
+  Permissions (mode bits: rwxr-xr-x → 0755)
+  Owner UID and group GID
+  Timestamps: atime (accessed), mtime (modified), ctime (metadata changed)
+  Hard link count
+  Pointers to data blocks (where the actual content lives)
 
-The filename lives in the directory entry (which is another file).
-The directory maps: "filename.txt" → inode number 12345
+What an inode does NOT store:
+  The filename — filenames live in directory entries
+  The file content — content lives in data blocks
 
-When you run: ls -li
-  You see inode numbers in the first column
+The directory is a file that maps: "disk01.img" → inode 12345
+When you run ls -li, the first column is the inode number.
+
+Run now: ls -li /tmp/px-lab/mounts/ext4test/ | head
+You'll see a number like 12 13 14 ... in the first column.
 ```
 
 **3-step diagnostic for "No space left on device"**:
 
 ```
-Step 1: Check if disk is full (space)
-  df -h /path/to/filesystem
-  → If 100%: delete large files. Done.
-  → If not 100%: go to Step 2
+Step 1: Is the disk full?
+  df -h /affected/path
+  → IUse% = 100%: disk full → delete or move large files
+  → IUse% < 100%: not a space problem → go to Step 2
 
-Step 2: Check if inodes are exhausted
-  df -i /path/to/filesystem
-  → If IUse% = 100%: find and remove directories with millions of small files
-  → Find culprit: find / -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head
-  → If not 100%: go to Step 3
+Step 2: Are inodes exhausted?
+  df -i /affected/path
+  → IUse% = 100%: inode exhaustion
+  → Find the directory with millions of files:
+    find /affected/path -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head
+  → Fix: delete the directory of small files, or remount after freeing them
+  → Permanent fix: use XFS (dynamic inodes) instead of ext4
+  → IUse% < 100%: go to Step 3
 
-Step 3: Check for deleted-but-open files
-  lsof +L1 | grep /path/to/filesystem
-  → If found: restart the process holding the file open
-  → Space will be reclaimed after handle is closed
+Step 3: Are deleted files still held open?
+  lsof +L1 | grep /affected/path
+  → Shows files that are deleted from the directory but still open by a process
+  → The kernel cannot free the disk blocks until the process closes the file handle
+  → Fix: restart the process holding the file open
+```
+
+**Real-world connection**:
+
+```
+This exact scenario — "No space left on device" with df -h showing 10% used —
+is one of the most common 3AM Elasticsearch incidents.
+
+Production setup:
+  Elasticsearch node → Portworx volume → data node pod
+  Elasticsearch writes 1 Lucene segment file per index shard per merge cycle
+  A busy cluster with 100 shards can create thousands of segment files per hour
+
+On ext4 (default inode count):
+  250GB ext4 volume → ~15 million inodes
+  Sounds like a lot, but busy ES with 100 shards × heavy indexing exhausts this in days
+
+On XFS (Portworx default):
+  XFS allocates inodes dynamically — no fixed limit
+  XFS never generates "No space left on device" due to inodes
+  This is why Portworx chose XFS as default for all volumes
+
+SRE playbook when you see this at 3AM:
+  1. df -h → not full
+  2. df -i → 100% inodes (now you know)
+  3. find → Elasticsearch data directory has millions of segment files
+  4. Short-term: delete old indices via Elasticsearch API
+  5. Long-term: migrate to Portworx XFS volume with StorageClass xfs parameter
 ```
 
 ---
 
 ### Solution Q14 — Format with XFS and Compare
 
-**Commands**:
+**Commands** (run inside container):
 
 ```bash
-# Create second disk for XFS
+# Step 1: Create a second 500MB disk for XFS
 dd if=/dev/zero of=/tmp/px-lab/disks/disk02.img bs=1M count=500 status=none
 DISK02=$(losetup -f --show /tmp/px-lab/disks/disk02.img)
+echo "XFS disk attached as: $DISK02"
+# Note: DISK02 is a whole device (no partitions) — we format it directly
+# This mirrors how Portworx uses raw block devices
 
-# Format with XFS
+# Step 2: Format with XFS
 mkfs.xfs $DISK02
+# You will see: meta-data=/dev/loop1 isize=512 ...
+
+# Step 3: Mount it
 mkdir -p /tmp/px-lab/mounts/xfstest
 mount $DISK02 /tmp/px-lab/mounts/xfstest
 
-# Compare inodes: ext4 vs XFS
-echo "=== ext4 inodes ==="
+# Step 4: Compare inode allocation between ext4 and XFS
+echo "=== ext4 inodes (250MB partition, fixed at format) ==="
 df -i /tmp/px-lab/mounts/ext4test
+# Filesystem     Inodes  IUsed  IFree IUse% Mounted on
+# /dev/loop0p1    65536    111  65425    1% /tmp/px-lab/mounts/ext4test
+# ↑ 65,536 inodes — decided at mkfs time, never changes
 
-echo "=== XFS inodes ==="
+echo "=== XFS inodes (500MB device, dynamic) ==="
 df -i /tmp/px-lab/mounts/xfstest
-# XFS shows Inodes: 0 (dynamic — not pre-allocated!)
+# Filesystem     Inodes IUsed  IFree IUse% Mounted on
+# /dev/loop1          0     3      0    0% /tmp/px-lab/mounts/xfstest
+# ↑ Inodes: 0 — XFS doesn't pre-allocate; df -i can't show a fixed count
+#   IFree: 0 — not zero because it's full, but because the number is dynamic
+#   XFS grows its inode table as files are created; the limit is disk space itself
 
-# Get detailed info
-echo "=== ext4 info ==="
+# Step 5: Get detailed filesystem info
+echo "=== ext4 superblock info ==="
 tune2fs -l ${DISK01}p1 | grep -iE "inode|block|journal"
+# Inode count: 65536
+# Block count: 63488
+# Journal size: 4096 blocks
+# Journal mode: ordered
 
-echo "=== XFS info ==="
-xfs_info $DISK02
+echo "=== XFS filesystem geometry ==="
+xfs_info /tmp/px-lab/mounts/xfstest
+# meta-data=/dev/loop1 isize=512 agcount=4, agsize=32000 blks
+#          =              sectsz=512  attr=2, projid32bit=1
+# data     =              bsize=4096  blocks=128000, imaxpct=25
+#          =              sunit=0 blks, swidth=0 blks
+# naming   =version 2     bsize=4096  ascii-ci=0, ftype=1
+# log      =internal log   bsize=4096  blocks=1368, version=2
+# realtime =none           extsz=4096  blocks=0, rtextents=0
 
-# Try to "shrink" XFS — should fail
-# xfs_growfs only grows, never shrinks
+# imaxpct=25 means XFS will allocate up to 25% of disk space for inodes
+# On a 500MB disk: up to 125MB available for inodes (dynamically allocated)
+
+# Step 6: Attempt to shrink XFS (this will fail)
 xfs_growfs -d /tmp/px-lab/mounts/xfstest 2>&1
-# Error: xfs_growfs: filesystem is already maximum size
+# data blocks changed from 128000 to 128000
+# or: xfs_growfs: XFS_IOC_FSGROWFSDATA xfsctl failed: Invalid argument
+# XFS can only GROW, never shrink.
 ```
 
-**Comparison table**:
+**Completed comparison table**:
 
 | Property | ext4 | XFS |
 |----------|------|-----|
@@ -900,42 +1089,87 @@ xfs_growfs -d /tmp/px-lab/mounts/xfstest 2>&1
 | Max filesystem size | 1 EB | 8 EB |
 | Can shrink online? | No | No |
 | Can grow online? | Yes | Yes |
-| Performance at large file count | Good | Better (parallel allocation) |
-| Default journal mode | ordered | always-on, more robust |
-| Inode exhaustion risk | Yes (fixed count) | No (dynamic) |
+| Performance at large file count | Good | Better (parallel B-tree allocation) |
+| Default journal mode | ordered | always-on (write-ahead log) |
+| Inode exhaustion risk | Yes (fixed count, can hit 100%) | No (limited only by disk space) |
+| Default in Portworx | No | Yes |
 
-**Why Portworx prefers XFS** (two specific reasons):
+**Why XFS wins for Portworx — two specific reasons from what you observed**:
 
 ```
-Reason 1: Dynamic inodes
-  Portworx volumes are used by databases and applications that write many files
-  ext4's fixed inode count can be exhausted (as you just proved in Q13)
-  XFS never exhausts inodes — it allocates them as needed
-  Eliminates an entire class of production incidents
+Reason 1: No inode exhaustion (you proved this in Q13)
+  ext4 pre-allocates inodes at format time — you watched a 100MB filesystem run out
+  at 491 files despite 92MB of free space.
+  XFS does not pre-allocate — its inode table grows as files are created.
+  Portworx volumes serve databases (MySQL, Postgres, Elasticsearch, Cassandra).
+  These applications can create thousands of small files per hour.
+  XFS eliminates the inode exhaustion failure mode entirely.
 
-Reason 2: Better concurrent write performance
-  XFS uses B-tree data structures for block allocation
-  Handles multiple concurrent writers more efficiently
-  Database workloads do concurrent random writes
-  XFS B-tree allocation avoids the fragmentation that hurts ext4 under concurrent load
-  Portworx volumes typically serve databases → XFS matches the workload
+Reason 2: Better concurrent write throughput (visible in xfs_info output)
+  XFS uses B-tree structures for both inode management and extent allocation.
+  agcount=4 in xfs_info means XFS creates 4 allocation groups on a 500MB device.
+  Each allocation group has its own lock.
+  Multiple concurrent writers can operate on different allocation groups in parallel.
+  ext4's single block group lock becomes a bottleneck under concurrent writes.
+  Database engines do concurrent random writes (InnoDB, RocksDB, WAL writers).
+  XFS handles this better → lower write latency under load → faster Portworx volumes.
+```
+
+**Real-world connection**:
+
+```
+Portworx StorageClass for a production MySQL cluster:
+
+  apiVersion: storage.k8s.io/v1
+  kind: StorageClass
+  metadata:
+    name: portworx-mysql
+  provisioner: pxd.portworx.com
+  parameters:
+    repl: "3"
+    io_profile: "db"        ← tuned for database I/O patterns
+    fs: "xfs"               ← explicitly XFS (default but made explicit here)
+
+When Portworx provisions this volume, it runs mkfs.xfs on the raw Portworx device.
+The MySQL pod's /var/lib/mysql is an XFS volume.
+If a developer asks "why XFS?", you now have two data-driven answers from this lab.
+
+Cloud provider comparison:
+  AWS EFS (managed NFS): uses ext4 internally — can hit inode limits
+  AWS EBS (block storage): you choose the filesystem when mounting
+  Google Persistent Disk: XFS or ext4 depending on your mkfs call
+  Portworx: always XFS by default — consistent behavior regardless of cloud
 ```
 
 ---
 
-### Solution Q15 — Inode Exhaustion Incident
+### Solution Q15 — Simulate Inode Exhaustion (Production Incident)
 
-**Commands**:
+**Commands** (run inside container):
 
 ```bash
-# Create limited inode filesystem
+# Step 1: Create a limited-inode filesystem (simulates a poorly-configured production volume)
 dd if=/dev/zero of=/tmp/px-lab/disks/inodecrash.img bs=1M count=200 status=none
 INODEDISK=$(losetup -f --show /tmp/px-lab/disks/inodecrash.img)
+
 mkfs.ext4 -N 1000 $INODEDISK -q
+# -N 1000: create filesystem with only 1000 inodes
+# -q: quiet mode
+# The filesystem has ~196MB of data space but only 1000 slots for files
+
 mkdir -p /tmp/px-lab/mounts/inodecrash
 mount $INODEDISK /tmp/px-lab/mounts/inodecrash
 
-# Run the filling script
+# Verify initial state: space looks fine, inodes limited
+df -h /tmp/px-lab/mounts/inodecrash
+# Filesystem      Size  Used Avail Use%
+# /dev/loopX      191M  1.6M  176M   1%   ← looks healthy
+
+df -i /tmp/px-lab/mounts/inodecrash
+# Filesystem     Inodes IUsed IFree IUse%
+# /dev/loopX       1000    11   989    1%  ← 1000 total, 11 used by system
+
+# Step 2: Run the file-creation loop (simulates Elasticsearch writing segment files)
 for i in $(seq 1 1100); do
   result=$(touch /tmp/px-lab/mounts/inodecrash/file_$i 2>&1)
   if [ -n "$result" ]; then
@@ -943,49 +1177,124 @@ for i in $(seq 1 1100); do
     break
   fi
 done
-```
+# Expected output:
+# FAILED at file ~990: touch: cannot touch '.../file_990': No space left on device
+# (fails before 1000 because the filesystem itself uses ~11 inodes for metadata)
 
-**Expected output**:
-
-```
-FAILED at file 1001: touch: cannot touch '/tmp/px-lab/mounts/inodecrash/file_1001': No space left on device
-```
-
-**Diagnostic**:
-
-```bash
-# Misleading: df -h shows space available
+# Step 3: Run the deceptive diagnostics a confused SRE would run first
+echo "=== What df -h shows (misleading) ==="
 df -h /tmp/px-lab/mounts/inodecrash
-# /dev/loop5   196M   2.0M   194M   2%  /tmp/px-lab/mounts/inodecrash
-# 2% used! Disk is not full!
+# Filesystem      Size  Used Avail Use%
+# /dev/loopX      191M  9.8M  168M   6%   ← 6% used, 168MB free — NOT the problem
 
-# Revealing: df -i shows inodes exhausted
+echo "=== What df -i shows (reveals the truth) ==="
 df -i /tmp/px-lab/mounts/inodecrash
-# /dev/loop5   1000   1000      0  100%  /tmp/px-lab/mounts/inodecrash
-# 100% inodes used! This is the real problem.
+# Filesystem     Inodes IUsed IFree IUse%
+# /dev/loopX       1000  1000     0  100%  ← ZERO inodes left
 
-# Find the directory with the most files
+# Step 4: Find which directory has the most files
 find /tmp/px-lab/mounts/inodecrash -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head
-# 1000 /tmp/px-lab/mounts/inodecrash
+# 989 /tmp/px-lab/mounts/inodecrash
+# ← the root of the mount has 989 files (the ones you created)
 ```
 
-**The complete 3-step diagnostic procedure**:
+**The 3-step production diagnostic procedure**:
 
 ```bash
-# STEP 1: Check space (rules out disk full)
-df -h /affected/path
-# → If 100%: disk full → delete large files
-# → If not 100%: go to step 2
+# ─────────────────────────────────────────────────────
+# 3AM RUNBOOK: "No space left on device" on a Portworx volume
+# ─────────────────────────────────────────────────────
 
-# STEP 2: Check inodes (rules out inode exhaustion)
-df -i /affected/path
-# → If 100%: inode exhausted → delete directories with many small files
-# → Find culprit: find /affected/path -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head
-# → If not 100%: go to step 3
+# STEP 1: Is the disk full? (rule out the obvious)
+df -h /var/lib/elasticsearch    # or whatever the mount path is
+# → If Use% is 100%: disk full
+#   Short-term: delete old indices or log files
+#   Long-term: expand the PVC via kubectl patch / Portworx Autopilot
+#
+# → If Use% < 100% (e.g., 6%): disk is NOT full → go to Step 2
 
-# STEP 3: Check open-but-deleted file handles
-lsof +L1 | grep /affected/path
-# → If found: restart process, space reclaimed when file handle closes
+# STEP 2: Are inodes exhausted? (the hidden culprit)
+df -i /var/lib/elasticsearch
+# → If IUse% is 100%: INODE EXHAUSTION confirmed
+#   Find the offending directory:
+find /var/lib/elasticsearch -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head
+#   Short-term: delete old data (old ES indices, old log files, old segment files)
+#   Long-term: migrate volume to XFS — XFS never exhausts inodes
+#
+# → If IUse% < 100%: go to Step 3
+
+# STEP 3: Are deleted files still held open? (the ghost files)
+lsof +L1 | grep /var/lib/elasticsearch
+# → Shows files deleted from the directory but still open by Elasticsearch process
+#   The kernel cannot reclaim those blocks until the process closes the file handle
+#   Fix: restart Elasticsearch — it will close all file handles
+#   The disk space is reclaimed immediately after process restart
+```
+
+**What the error looks like from a Kubernetes pod**:
+
+```
+$ kubectl logs elasticsearch-data-0 -n monitoring | tail -20
+...
+[2026-07-02T03:14:22,431][ERROR][o.e.i.e.Engine] [node-1] [logs-2026.07][0]
+  failed engine [index]
+org.apache.lucene.store.LockObtainFailedException: Failed to obtain lock on ...
+Caused by: java.io.IOException: No space left on device
+    at java.io.UnixFileSystem.createFileExclusively(Native Method)
+
+$ kubectl exec -it elasticsearch-data-0 -- df -h /usr/share/elasticsearch/data
+Filesystem      Size  Used Avail Use%
+/dev/pxd/pxd123  200G   18G  182G  10%    ← 10% used, looks fine
+
+$ kubectl exec -it elasticsearch-data-0 -- df -i /usr/share/elasticsearch/data
+Filesystem       Inodes   IUsed   IFree IUse% Mounted on
+/dev/pxd/pxd123 13107200 13107200       0  100%    ← 100% inodes
+```
+
+**Why this happens on ext4 Portworx volumes but not XFS**:
+
+```
+A Portworx PVC backed by ext4:
+  200GB ext4 volume → ~13 million inodes (1 per 16KB)
+  Elasticsearch with 50 shards × heavy indexing:
+    → Lucene creates 5-10 segment files per shard per merge cycle
+    → 50 shards × 8 files × 100 merges/day = 40,000 files/day
+    → 13,000,000 ÷ 40,000 = ~325 days until inode exhaustion
+    → Production incident in year 2 — looks random, hard to correlate
+
+A Portworx PVC backed by XFS (the default):
+  XFS allocates inodes dynamically — they grow as needed
+  imaxpct=25 means up to 25% of disk space can be used for inodes
+  200GB × 25% = 50GB available for inode table
+  50GB / 512 bytes per inode = ~100 million inodes possible
+  Elasticsearch would run out of disk space long before XFS runs out of inodes
+
+This is why Portworx defaults to XFS. Not marketing — engineering.
+```
+
+**Real-world remediation**:
+
+```
+Emergency: pod is stuck, writes failing
+  1. kubectl exec into pod
+  2. df -h and df -i to confirm inode exhaustion
+  3. Delete old data inside the pod to free inodes:
+     curl -X DELETE http://localhost:9200/logs-2026.06.*  (Elasticsearch)
+  4. Pod resumes writing immediately
+
+Permanent fix option A: resize volume to ext4 with more inodes
+  - Not possible — you cannot change inode count after format
+  - You would need to create new volume, migrate data, swap PVC
+
+Permanent fix option B: migrate to XFS (the correct fix)
+  - Create new StorageClass with fs=xfs parameter
+  - Create new PVC, snapshot-restore data, update pod spec
+  - Portworx's volume clone/migration handles this without downtime
+
+Prevention: Portworx Autopilot + XFS default
+  - All new volumes created with Portworx's default StorageClass use XFS
+  - Autopilot expands volumes before they fill up
+  - Inode exhaustion on Portworx volumes is essentially eliminated
 ```
 
 ---

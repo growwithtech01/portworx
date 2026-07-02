@@ -278,108 +278,123 @@ Section D simulates disk failures and RAID degradation. These sound scary but:
 ## Section C — Build (Questions 11–15)
 
 > Goal: Create virtual storage from scratch. Every concept you read in Module 01 becomes something you built with your hands.
+>
+> **Your setup reminder**: MacBook (macOS) → Docker/Podman VM (Linux) → Ubuntu container. All commands below run inside the container. Loop devices live in the VM kernel — not on your Mac.
 
 ---
 
 ### Q11 — Create a Virtual Block Device (Loop Device)
 
-**Scenario**: In your team's development environment, there are no spare physical disks to test Portworx installation. You need to simulate a disk using only the filesystem. (This is exactly how Portworx dev environments work.)
+**Scenario**: In your team's development environment, there are no spare physical disks to test Portworx installation. You need to simulate a disk using only the filesystem. This is exactly how Portworx dev environments and CI pipelines work — no real hardware needed.
 
 **Task**:
 1. Create a 500MB disk image file at `/tmp/px-lab/disks/disk01.img`
-2. Attach it to a loop device
+2. Attach it to a loop device using `losetup -f --show`
 3. Verify it appears as a block device using `lsblk`
 4. Check its size: does `lsblk` show 500MB?
-5. Confirm it behaves like a real block device by checking its device type
+5. Confirm it behaves like a real block device: `ls -la $DISK01` — what does the first character tell you?
 
-**Question to answer**: What is a loop device? Why does the operating system treat a file as a block device? What kernel mechanism makes this work?
+**Container reality**: The loop device (`/dev/loop0`) is created inside the Docker/Podman VM's Linux kernel, not on macOS. Your Mac never sees `/dev/loop0`. The image file (`disk01.img`) lives at `/tmp/px-lab/disks/` inside the container, which maps to `~/px-lab/disks/` on your Mac — so the file persists even if the container restarts.
+
+**Question to answer**: What is a loop device? Why does the OS treat a regular file as a block device? Why does `lsmod | grep loop` show nothing even though loop devices work fine in this container?
 
 ---
 
 ### Q12 — Partition the Virtual Disk
 
-**Scenario**: A new SSD arrived in the data center. Before Portworx can use it, you need to create partitions. You need to understand partitioning before you can understand why Portworx does NOT partition its disks.
+**Scenario**: A new SSD arrived in the data center. You need to partition it before the storage team can use it. More importantly, you need to understand partitioning before you can understand why Portworx deliberately skips it.
 
 **Task**:
-1. Using the loop device from Q11, create a GPT partition table
-2. Create two partitions: 250MB each
-3. Verify the partitions appear as separate block devices
-4. Check the partition table type (GPT vs MBR)
+1. Using the loop device from Q11, create a GPT partition table with `parted`
+2. Create two partitions: first 50%, second 50%
+3. After `parted` completes, re-attach the loop device with partition scanning enabled (the critical container step — see note below)
+4. Verify `lsblk` shows `loop0p1` and `loop0p2` as child devices
+5. Check the partition table with `parted $DISK01 print`
 
-**After completing**: Note that Portworx actually uses the entire raw block device without partitioning. Why do you think this is?
+> **Container Note**: In a normal Linux server, `partprobe` or `kpartx` notify the kernel about new partitions. Inside a container, these tools are unreliable because the container shares the VM kernel but lacks full udev support. The correct approach is to detach the loop device and re-attach it with `--partscan`, which forces the kernel to read the partition table at attach time. The solution explains exactly how.
 
-**Question to answer**: What is the difference between GPT and MBR partition tables? What is the maximum number of partitions GPT supports? What is the practical limit?
+**After completing**: Portworx uses entire raw block devices (`useAll: true` in StorageCluster) without any partitioning. Once you see how partition scanning works — and how it can fail in containers — the Portworx design decision will make sense.
+
+**Question to answer**: What is the difference between GPT and MBR partition tables? Why does Portworx prefer raw unpartitioned disks over partitioned ones?
 
 ---
 
 ### Q13 — Format with ext4 and Explore Inodes
 
-**Scenario**: You are setting up a log server. A developer says "we'll write millions of tiny 1KB log files." You need to understand inode limits before the system goes to production.
+**Scenario**: You are setting up a log aggregation server for a microservices platform. A developer says "we will write one log file per request — that could be millions of tiny 1KB files per day." You need to understand inode limits before this goes to production and pages you at 3AM.
 
 **Task**:
-1. Format the first partition from Q12 with ext4
+1. Format the first partition (`${DISK01}p1`) from Q12 with ext4
 2. Mount it at `/tmp/px-lab/mounts/ext4test`
-3. Run `df -i` to see the inode count
-4. Answer: how many inodes were created? Why this number?
-5. Create 100 small files and observe inode usage
-6. Format a second device with ext4 specifying a very small inode count (`-N 500`)
-7. Write 600 files and observe what happens
+3. Run `df -i` — how many inodes does a 250MB ext4 partition get by default?
+4. Create 100 small files and watch inode usage climb
+5. Now create a new 100MB image, format with `mkfs.ext4 -N 500` (only 500 inodes), mount it, then write 600 files
+6. Observe the exact error message when inodes run out
 
-**Question to answer**: What is an inode? What happens when you run out of inodes but still have free disk space? How does this manifest as an error?
+> **Container Note**: `${DISK01}p1` refers to the first partition of the re-attached loop device from Q12. This only works after the `--partscan` re-attach step. If you skipped that step, the device node `loop0p1` will not exist.
+
+**Question to answer**: What is an inode? What error do you get when inodes are exhausted but disk space is not? Why is this error message misleading — and what two commands do you run to diagnose it correctly?
 
 ---
 
 ### Q14 — Format with XFS and Compare to ext4
 
-**Scenario**: Portworx creates XFS filesystems on its volumes by default. You need to understand why XFS is preferred over ext4 for storage systems.
+**Scenario**: Portworx creates XFS filesystems on every volume it manages. You are asked in a job interview: "Why does Portworx use XFS instead of ext4?" You need to be able to answer from first-hand observation, not just documentation.
 
 **Task**:
-1. Create a new 500MB disk image and attach as a second loop device
-2. Format it with XFS (`mkfs.xfs`)
+1. Create a new 500MB disk image at `/tmp/px-lab/disks/disk02.img` and attach as a second loop device (`$DISK02`)
+2. Format it with XFS: `mkfs.xfs $DISK02` (format the full device, not a partition)
 3. Mount it at `/tmp/px-lab/mounts/xfstest`
-4. Compare: run `df -i` on both ext4 and XFS mounts
-5. Get info from both: `tune2fs -l /dev/loopX` (ext4) and `xfs_info /dev/loopY` (XFS)
-6. Try to shrink the XFS mount: `xfs_growfs -d /tmp/px-lab/mounts/xfstest` — what happens?
+4. Run `df -i` on both mounts — what does XFS report for inode count?
+5. Get detailed filesystem info: `tune2fs -l ${DISK01}p1` (ext4) and `xfs_info /tmp/px-lab/mounts/xfstest` (XFS)
+6. Attempt to shrink XFS: `xfs_growfs -d /tmp/px-lab/mounts/xfstest` — what is the result?
 
-**Fill this comparison table**:
+> **Container Note**: For ext4 info, `tune2fs -l ${DISK01}p1` uses the partition device from Q12. For XFS, `xfs_info` takes the mount point, not the device path. Both work correctly inside the container.
+
+**Fill this comparison table** (complete it from your observations):
 
 | Property | ext4 | XFS |
 |----------|------|-----|
-| Inode allocation | Fixed at format | Dynamic |
-| Max filesystem size | | |
-| Can shrink online? | | |
-| Can grow online? | | |
-| Performance at large file count | | |
-| Default journal mode | | |
+| Inode allocation | Fixed at format time | ? |
+| Max filesystem size | 1 EB | ? |
+| Can shrink online? | No | ? |
+| Can grow online? | Yes | ? |
+| Performance at large file count | Good | ? |
+| Default journal mode | ordered | ? |
+| Inode exhaustion risk | Yes | ? |
 
-**Question to answer**: Why does Portworx prefer XFS? Give two specific reasons based on what you observed.
+**Question to answer**: Give two specific reasons — from what you observed in this lab — why Portworx defaults to XFS. Connect each reason to a real-world database or production workload.
 
 ---
 
 ### Q15 — Simulate Inode Exhaustion (Production Incident)
 
-**Scenario**: At 3AM you receive a PagerDuty alert: "Pod cannot write to volume. Error: No space left on device." You check `df -h` and it shows 60% used. The disk is not full. What is happening?
+**Scenario**: It is 3AM. PagerDuty fires: "Elasticsearch pod cannot write to its data volume. Error: No space left on device." You SSH into the node and run `df -h` — the disk is only 18% full. Your heart sinks. Something is wrong at a level below disk space. Walk through the diagnosis.
 
 **Task**:
-1. Create a small ext4 filesystem limited to 1000 inodes (`mkfs.ext4 -N 1000`)
-2. Mount it
-3. Write a script that creates files in a loop until it fails
-4. Observe the exact error message
-5. Run `df -h` (space looks fine) and `df -i` (inodes exhausted)
-6. Find which directory has the most files: `find . -xdev -printf '%h\n' | sort | uniq -c | sort -rn | head`
+1. Create a 200MB ext4 filesystem limited to 1000 inodes: `mkfs.ext4 -N 1000`
+2. Mount it at `/tmp/px-lab/mounts/inodecrash`
+3. Run the file-creation loop below until it fails — capture the exact error
+4. Run `df -h` (shows space available) then `df -i` (shows inodes at 100%) — compare the two outputs
+5. Find the directory with the most files using `find`
+6. Write the 3-step production diagnostic procedure
 
-**The script to run**:
+**The script to run inside the container**:
 ```bash
 for i in $(seq 1 1100); do
-  touch /tmp/px-lab/mounts/inodetest/file_$i 2>&1
-  if [ $? -ne 0 ]; then
-    echo "FAILED at file $i"
+  result=$(touch /tmp/px-lab/mounts/inodecrash/file_$i 2>&1)
+  if [ -n "$result" ]; then
+    echo "FAILED at file $i: $result"
     break
   fi
 done
 ```
 
-**Question to answer**: Write the 3-step diagnostic procedure for "No space left on device" that rules out inode exhaustion. What is your first command? What are you looking for?
+> **Container Note**: This entire exercise runs inside the Ubuntu container on the Podman/Docker VM. The inode exhaustion happens on a loop-device-backed filesystem inside the container — zero impact on your Mac or on the VM's own filesystem.
+
+**Real-world connection**: Elasticsearch writes one segment file per indexed document batch. Under high ingest load, this can create thousands of small files per hour on the data volume. An ELK stack (Elasticsearch + Logstash + Kibana) running on a Portworx XFS volume never hits this problem — XFS allocates inodes dynamically. The same stack on an ext4 volume with default inode density can exhaust inodes within days under heavy log ingestion.
+
+**Question to answer**: Write the 3-step diagnostic for "No space left on device" errors. What is the first command? What does each step rule out? What is the fix for inode exhaustion (hint: you cannot just delete data)?
 
 ---
 
